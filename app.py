@@ -1,12 +1,13 @@
 import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from core.extractor import extract_page_data
 from core.screenshot import capture_screenshot
 from core.generator import generate_clone_html
 from ui.sidebar import render_sidebar
 from ui.preview import render_preview
-from dotenv import load_dotenv
-
-load_dotenv()
 
 st.set_page_config(
     page_title="AutoWeb – AI Website Clone Generator",
@@ -17,74 +18,97 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    .hero-title {
-        font-size: 3rem; font-weight: 800;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-    }
-    .hero-sub { font-size: 1.15rem; color: #555; margin-bottom: 30px; }
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white; border: none; border-radius: 12px;
-        padding: 12px 32px; font-size: 1rem;
-        font-weight: 600; width: 100%;
-    }
-    .stButton > button:hover { opacity: 0.88; }
-    footer { visibility: hidden; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+.hero-title {
+    font-size: 2.8rem; font-weight: 800; line-height: 1.2;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+}
+.hero-sub { font-size: 1.05rem; color: #666; margin-bottom: 28px; }
+.stButton > button {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white !important; border: none; border-radius: 12px;
+    padding: 12px 32px; font-size: 1rem; font-weight: 600;
+    width: 100%; transition: opacity 0.2s;
+}
+.stButton > button:hover { opacity: 0.85; }
+footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Persistent session state ───────────────────────────────────────────────
+for key in ["clone_html", "data", "shot_path", "agent_used", "agent_logs", "chars"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
 render_sidebar()
 
+# ── Hero ───────────────────────────────────────────────────────────────────
 st.markdown('<div class="hero-title">🌐 AutoWeb</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Paste any public website URL. AutoWeb captures, analyses, and generates a clone using Gemini AI.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="hero-sub">Paste any public website URL. AutoWeb captures, '
+    'analyses, and clones it using a smart multi-agent AI chain '
+    '(Gemini → Groq → Ollama).</div>',
+    unsafe_allow_html=True
+)
 
-col_input, col_help = st.columns([3, 1])
+col_input, col_btn = st.columns([4, 1])
 with col_input:
-    url = st.text_input("", placeholder="https://example.com", label_visibility="collapsed")
-with col_help:
+    url = st.text_input(
+        "",
+        placeholder="https://example.com",
+        label_visibility="collapsed",
+        key="url_input"
+    )
+with col_btn:
     st.markdown("<br>", unsafe_allow_html=True)
-    st.caption("Works best on public landing pages")
+    generate = st.button("⚡ Generate")
 
-if st.button("⚡ Generate Clone"):
+if generate:
     if not url.strip():
         st.error("Please enter a valid URL.")
     elif not url.startswith("http"):
         st.error("URL must start with http:// or https://")
     else:
-        progress = st.progress(0, text="Starting...")
+        progress = st.progress(0, text="🚀 Starting...")
 
         with st.spinner("📡 Fetching page data..."):
             data, fetch_error = extract_page_data(url)
-            progress.progress(33, text="Page data extracted...")
-
+            progress.progress(20, text="✅ Page data extracted")
         if fetch_error:
-            st.warning(f"Partial fetch: {fetch_error}")
+            st.warning(f"Fetch warning (continuing anyway): {fetch_error}")
 
         with st.spinner("📸 Capturing screenshot..."):
             shot_path, shot_error = capture_screenshot(url)
-            progress.progress(66, text="Screenshot captured...")
-
+            progress.progress(45, text="✅ Screenshot captured")
         if shot_error:
-            st.warning(f"Screenshot issue: {shot_error}")
+            st.warning(f"Screenshot warning: {shot_error}")
 
-        with st.spinner("🤖 Gemini is generating your clone..."):
-            clone_html = generate_clone_html(data)
-            progress.progress(100, text="Done!")
+        with st.spinner("🤖 A2A agent chain running... (Gemini → Groq → Ollama)"):
+            result = generate_clone_html(data)
+            progress.progress(100, text="✅ Clone generated!")
 
         progress.empty()
 
-        st.session_state["data"] = data
-        st.session_state["clone_html"] = clone_html
-        st.session_state["shot_path"] = shot_path
-        st.success("✅ Clone generated successfully!")
+        # ── Save everything to session state ──────────────────────────────
+        st.session_state["clone_html"] = result["html"]
+        st.session_state["data"]       = data
+        st.session_state["shot_path"]  = shot_path
+        st.session_state["agent_used"] = result["agent_used"]
+        st.session_state["agent_logs"] = result["logs"]
+        st.session_state["chars"]      = result["chars"]
 
-if "clone_html" in st.session_state:
+        st.success(f"✅ Clone generated by: **{result['agent_used']}**")
+
+# ── Always render from session state (persists across tab switches) ────────
+if st.session_state["clone_html"]:
     render_preview(
-        st.session_state["clone_html"],
-        st.session_state["data"],
-        st.session_state.get("shot_path")
+        clone_html = st.session_state["clone_html"],
+        data       = st.session_state["data"],
+        shot_path  = st.session_state["shot_path"],
+        agent_used = st.session_state["agent_used"],
+        agent_logs = st.session_state["agent_logs"],
+        chars      = st.session_state["chars"]
     )

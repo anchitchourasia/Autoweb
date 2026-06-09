@@ -3,4 +3,6 @@ playwright
 beautifulsoup4
 requests
 python-dotenv
-google-generativeai
+google-genai
+groq
+ollama
