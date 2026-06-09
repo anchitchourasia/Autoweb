@@ -55,26 +55,26 @@ def _is_available(provider: str) -> bool:
         return False
 
 
-def _mark_rate_limited(provider: str, retry_after_seconds: int = 60):
+def _mark_rate_limited(provider: str, retry_after: int = 60):
     with _lock:
         s = agent_registry[provider]
-        s["available"] = False
-        s["cooldown_until"] = datetime.now() + timedelta(seconds=retry_after_seconds)
-        s["errors"] += 1
-        print(f"[A2A] ⏳ {provider} cooldown {retry_after_seconds}s "
-              f"→ recovers at {s['cooldown_until'].strftime('%H:%M:%S')}")
+        s["available"]      = False
+        s["cooldown_until"] = datetime.now() + timedelta(seconds=retry_after)
+        s["errors"]        += 1
+        print(f"[A2A] ⏳ {provider} cooldown {retry_after}s → "
+              f"recovers at {s['cooldown_until'].strftime('%H:%M:%S')}")
 
 
 def _mark_success(provider: str):
     with _lock:
-        agent_registry[provider]["calls"] += 1
+        agent_registry[provider]["calls"]    += 1
         agent_registry[provider]["available"] = True
 
 
 def _mark_error(provider: str, error: str):
     with _lock:
-        agent_registry[provider]["errors"] += 1
-        agent_registry[provider]["last_error"] = error[:300]
+        agent_registry[provider]["errors"]     += 1
+        agent_registry[provider]["last_error"]  = error[:300]
 
 
 def get_agent_status() -> dict:
@@ -88,97 +88,126 @@ def get_agent_status() -> dict:
     }
 
 
-def _parse_retry_after(error_str: str) -> int:
-    match = re.search(r"retry.{0,10}?(\d+)", error_str, re.IGNORECASE)
-    if match:
-        return max(int(match.group(1)), 5)
-    return 60
+def _parse_retry_after(err: str) -> int:
+    m = re.search(r"retry.{0,10}?(\d+)", err, re.IGNORECASE)
+    return max(int(m.group(1)), 5) if m else 60
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROMPT TEMPLATES
+# PROMPT TEMPLATES — each agent has a DIFFERENT specialized role
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _prompt_structure(data: dict, partial_html: str = "") -> str:
-    return f"""You are a senior frontend developer and UI/UX expert.
-Analyze the website data below and generate a COMPLETE, BEAUTIFUL, PIXEL-PERFECT
-single-file HTML clone with all CSS inside a <style> tag.
+def _prompt_agent1_structure(data: dict) -> str:
+    """
+    AGENT 1 — GEMINI
+    Role: Architect. Builds the full HTML skeleton with layout, sections,
+    semantic structure. Focus on completeness and correct structure.
+    """
+    return f"""You are Agent 1 of 3 in an AI pipeline. Your role: HTML ARCHITECT.
+Your job is to generate the complete HTML structure and layout.
+Agents 2 and 3 will enhance your output — so focus on COMPLETE STRUCTURE.
 
-=== WEBSITE DATA ===
+=== WEBSITE TO CLONE ===
 URL:         {data['url']}
 TITLE:       {data['title']}
 DESCRIPTION: {data['meta_desc']}
-COLORS:      {json.dumps(data['colors'])}
 HEADINGS:    {json.dumps(data['headings'], ensure_ascii=False)}
 NAV LINKS:   {json.dumps(data['nav_links'], ensure_ascii=False)}
 CTA BUTTONS: {json.dumps(data['buttons'], ensure_ascii=False)}
-CONTENT:     {data['text'][:4500]}
+COLORS:      {json.dumps(data['colors'])}
+CONTENT:     {data['text'][:4000]}
 
-=== REQUIREMENTS ===
-1. Return ONLY raw HTML. Zero markdown. Zero explanation. Start with <!doctype html>
-2. Sections: sticky navbar → hero → features/cards → stats → CTA banner → footer
-3. Use the detected color palette authentically
-4. Google Fonts @import allowed (prefer Inter or Poppins)
-5. Placeholder images: https://placehold.co/600x400?text=Preview
-6. CSS Grid + Flexbox, mobile responsive @media at 768px and 480px
-7. Smooth hover transitions (0.3s ease) on all buttons and cards
-8. Card shadows and rounded corners (border-radius: 12px+)
-9. Hero section with gradient background using detected colors
-10. Quality must genuinely impress a senior hiring manager
+=== YOUR TASK ===
+Generate a complete single-file HTML clone with embedded CSS <style> tag.
+Include ALL these sections:
+1. Sticky navbar with logo + all nav links + CTA button
+2. Hero section — big headline, subheading, 2 CTA buttons, gradient background
+3. Features/cards section — use headings as card titles (min 3 cards)
+4. Stats section — 3-4 impressive numbers
+5. Testimonial or About section
+6. CTA banner section
+7. Footer — links, copyright, social icons
+
+RULES:
+- Return ONLY raw HTML. Start with <!doctype html>. Zero markdown. Zero explanation.
+- Use detected colors: {json.dumps(data['colors'])}
+- Google Fonts @import (Inter or Poppins)
+- Placeholder images: https://placehold.co/600x400?text=Preview
+- CSS variables: --primary, --secondary, --bg, --text
+- Mobile responsive with @media (max-width: 768px)
 """
 
 
-def _prompt_style(data: dict, partial_html: str = "") -> str:
-    base = f"""You are a CSS specialist and expert frontend developer.
-Generate a modern, visually stunning, fully responsive HTML clone.
+def _prompt_agent2_style(data: dict, html_from_agent1: str) -> str:
+    """
+    AGENT 2 — GROQ
+    Role: CSS Stylist. Takes Agent 1's HTML and makes it visually stunning.
+    Rewrites/enhances all CSS while keeping the structure.
+    """
+    return f"""You are Agent 2 of 3 in an AI pipeline. Your role: CSS STYLIST.
+Agent 1 (Gemini) generated the HTML structure. Your job: make it VISUALLY STUNNING.
 
-=== SITE INFO ===
-URL:      {data['url']}
-TITLE:    {data['title']}
-COLORS:   {json.dumps(data['colors'])}
-HEADINGS: {json.dumps(data['headings'][:15], ensure_ascii=False)}
-NAV:      {json.dumps(data['nav_links'][:12], ensure_ascii=False)}
-BUTTONS:  {json.dumps(data['buttons'], ensure_ascii=False)}
-CONTENT:  {data['text'][:3500]}
+=== ORIGINAL SITE INFO ===
+URL:    {data['url']}
+TITLE:  {data['title']}
+COLORS: {json.dumps(data['colors'])}
 
-=== FOCUS AREAS ===
-- Modern typography using Google Fonts (Inter preferred)
-- CSS custom properties (--primary, --secondary, --bg, --text)
-- Smooth animations: fade-in (use @keyframes), hover effects
-- Card grid layout with box-shadow and border-radius
-- Mobile-first responsive with @media (max-width: 768px)
-- Gradient hero section, professional footer
+=== AGENT 1's OUTPUT (enhance this) ===
+{html_from_agent1[:6000]}
 
-RULES: Return ONLY raw HTML starting with <!doctype html>. No markdown, no backticks.
-Placeholder images: https://placehold.co/600x400?text=Image
+=== YOUR TASK ===
+Rewrite the entire <style> section to be world-class CSS. Keep all HTML structure intact.
+Add/enhance:
+1. CSS custom properties (--primary, --secondary, --accent, --bg, --text, --shadow)
+2. Smooth animations: @keyframes fadeInUp, slideIn for hero elements
+3. Hover effects: card lift (translateY(-8px)), button glow (box-shadow)
+4. Card grid with glassmorphism or neumorphism effect
+5. Gradient text for headings using -webkit-background-clip
+6. Sticky navbar with blur backdrop-filter
+7. Smooth scroll behavior
+8. Professional typography scale
+
+RULES:
+- Return the COMPLETE HTML file (structure + your enhanced CSS)
+- Start with <!doctype html>. No markdown. No explanation.
+- Keep ALL existing HTML content and sections — only enhance CSS
+- Use the detected color palette: {json.dumps(data['colors'])}
 """
-    if partial_html and len(partial_html) > 200:
-        base += f"\n\nPrevious agent generated partial output. Complete and improve:\n{partial_html[-1500:]}"
-    return base
 
 
-def _prompt_content(data: dict, partial_html: str = "") -> str:
-    return f"""You are a frontend developer. Generate a complete HTML webpage clone.
+def _prompt_agent3_refine(data: dict, html_from_agent2: str) -> str:
+    """
+    AGENT 3 — OLLAMA
+    Role: Finalizer. Reviews both agents' work, fixes issues,
+    adds final polish and makes it production-ready.
+    """
+    return f"""You are Agent 3 of 3 in an AI pipeline. Your role: QUALITY FINALIZER.
+Agents 1 (structure) and 2 (styling) have already worked on this HTML.
+Your job: final polish, fix any issues, make it PRODUCTION READY.
 
-Site:        {data['url']}
-Title:       {data['title']}
-Description: {data['meta_desc']}
-Headings:    {json.dumps([h['text'] for h in data['headings'][:10]])}
-Navigation:  {json.dumps([l['text'] for l in data['nav_links'][:10]])}
-Buttons:     {json.dumps(data['buttons'][:6])}
-Colors:      {json.dumps(data['colors'][:6])}
-Content:     {data['text'][:3000]}
+=== ORIGINAL SITE ===
+URL:   {data['url']}
+TITLE: {data['title']}
 
-Create a single HTML file with embedded CSS that includes:
-1. Navigation bar with logo and all nav links
-2. Hero section with main heading and CTA button
-3. Features section using headings as card titles
-4. Simple footer with links
+=== PREVIOUS AGENTS' OUTPUT (finalize this) ===
+{html_from_agent2[:7000]}
 
-CRITICAL: Return ONLY HTML code. Start immediately with <!doctype html>
-No explanations, no markdown, no code blocks.
-Use the detected colors. Make it clean and professional.
-Placeholder images: https://placehold.co/600x400?text=Image
+=== YOUR TASK ===
+Review and improve the HTML. Fix these common issues:
+1. Any broken layout or missing closing tags
+2. Add smooth scroll JavaScript at bottom
+3. Add mobile hamburger menu toggle (JS)
+4. Improve accessibility (aria-labels, alt texts)
+5. Add loading animation for page (fade in body)
+6. Make CTA buttons more prominent with gradient
+7. Add subtle background pattern or texture to hero
+8. Ensure all sections have proper padding/margin
+
+RULES:
+- Return the COMPLETE final HTML. Start with <!doctype html>.
+- No markdown. No explanation. No code fences.
+- Keep all existing content — only improve and fix
+- This is the FINAL output so make it perfect
 """
 
 
@@ -209,37 +238,37 @@ def _call_groq(model: str, prompt: str) -> str:
         messages=[
             {
                 "role": "system",
-                "content": "You are a frontend developer. Return ONLY raw HTML "
-                           "with all CSS embedded. No markdown, no explanation, no code fences."
+                "content": "You are a frontend developer in a multi-agent pipeline. "
+                           "Return ONLY complete raw HTML with embedded CSS. "
+                           "No markdown, no explanation, no code fences."
             },
             {"role": "user", "content": prompt}
         ],
-        temperature=0.4,
+        temperature=0.3,
         max_tokens=8192
     )
-    # Groq returns Pydantic object — use dot notation
     return response.choices[0].message.content.strip()
 
 
 def _call_ollama(model: str, prompt: str) -> str:
     from ollama import Client
     api_key = os.getenv("OLLAMA_API_KEY")
-    if api_key:
-        client = Client(
-            host="https://ollama.com",
-            headers={"Authorization": f"Bearer {api_key}"}
-        )
-    else:
-        client = Client(host="http://localhost:11434")
-
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a frontend developer. Return ONLY raw HTML with embedded CSS. No markdown."
-        },
-        {"role": "user", "content": prompt}
-    ]
-    response = client.chat(model=model, messages=messages, stream=False)
+    client  = Client(
+        host    = "https://ollama.com" if api_key else "http://localhost:11434",
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    )
+    response = client.chat(
+        model    = model,
+        messages = [
+            {
+                "role":    "system",
+                "content": "You are a frontend developer finalizing HTML. "
+                           "Return ONLY complete raw HTML. No markdown."
+            },
+            {"role": "user", "content": prompt}
+        ],
+        stream=False
+    )
     return response["message"]["content"].strip()
 
 
@@ -247,219 +276,207 @@ def _clean_html(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
+        text = re.sub(r"\n?```\s*$",        "", text)
     if "<!doctype" not in text.lower() and "<html" not in text.lower():
         return ""
     return text.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# A2A AGENT CHAIN
+# FALLBACK CHAINS — if primary model fails, try next in same provider
 # ─────────────────────────────────────────────────────────────────────────────
 
-AGENT_CHAIN = [
-    {
-        "id":        "gemini-2.5-flash",
-        "name":      "Gemini 2.5 Flash",
-        "provider":  "gemini",
-        "model":     "gemini-2.5-flash",
-        "prompt_fn": _prompt_structure,
-        "role":      "Primary Structure & Layout Agent",
-        "icon":      "🧠"
-    },
-    {
-        "id":        "gemini-1.5-flash",
-        "name":      "Gemini 1.5 Flash",
-        "provider":  "gemini",
-        "model":     "gemini-1.5-flash",
-        "prompt_fn": _prompt_structure,
-        "role":      "Structure Agent — Gemini Fallback",
-        "icon":      "🧠"
-    },
-    {
-        "id":        "groq-llama33",
-        "name":      "Groq LLaMA 3.3 70B",
-        "provider":  "groq",
-        "model":     "llama-3.3-70b-versatile",
-        "prompt_fn": _prompt_style,
-        "role":      "Style & CSS Specialist Agent",
-        "icon":      "⚡"
-    },
-    {
-        "id":        "groq-llama3",
-        "name":      "Groq LLaMA 3 70B",
-        "provider":  "groq",
-        "model":     "llama3-70b-8192",
-        "prompt_fn": _prompt_style,
-        "role":      "Style Agent — Groq Fallback",
-        "icon":      "⚡"
-    },
-    {
-        "id":        "ollama-gpt-oss",
-        "name":      "Ollama Cloud — GPT-OSS 120B",
-        "provider":  "ollama",
-        "model":     "gpt-oss:120b-cloud",
-        "prompt_fn": _prompt_content,
-        "role":      "Content & Structure Agent — Ollama Cloud",
-        "icon":      "🦙"
-    },
-    {
-        "id":        "ollama-qwen",
-        "name":      "Ollama Cloud — Qwen3.5",
-        "provider":  "ollama",
-        "model":     "qwen3.5",
-        "prompt_fn": _prompt_content,
-        "role":      "Content Agent — Ollama Fallback 1",
-        "icon":      "🦙"
-    },
-    {
-        "id":        "ollama-deepseek",
-        "name":      "Ollama Cloud — DeepSeek V4 Flash",
-        "provider":  "ollama",
-        "model":     "deepseek-v4-flash",
-        "prompt_fn": _prompt_content,
-        "role":      "Content Agent — Ollama Fallback 2",
-        "icon":      "🦙"
-    },
-]
+GEMINI_MODELS  = ["gemini-2.5-flash", "gemini-1.5-flash"]
+GROQ_MODELS    = ["llama-3.3-70b-versatile", "llama3-70b-8192"]
+OLLAMA_MODELS  = ["gpt-oss:120b-cloud", "qwen3.5", "deepseek-v4-flash"]
+
+
+def _try_provider(provider: str, models: list, prompt: str, log: list) -> str:
+    """Try each model in a provider until one succeeds."""
+    for model in models:
+        if not _is_available(provider):
+            log.append({
+                "agent":    f"{provider} / {model}",
+                "status":   "skipped",
+                "reason":   "Provider on cooldown",
+                "duration": 0, "chars": 0
+            })
+            return ""
+
+        t = time.time()
+        try:
+            print(f"[A2A]    → trying {provider}/{model}...")
+            if provider == "gemini":
+                raw = _call_gemini(model, prompt)
+            elif provider == "groq":
+                raw = _call_groq(model, prompt)
+            elif provider == "ollama":
+                raw = _call_ollama(model, prompt)
+
+            html     = _clean_html(raw)
+            duration = round(time.time() - t, 1)
+
+            if len(html) < 300:
+                raise ValueError(f"Too short: {len(html)} chars")
+
+            _mark_success(provider)
+            log.append({
+                "agent":    f"{provider} / {model}",
+                "status":   "success",
+                "reason":   "",
+                "duration": duration,
+                "chars":    len(html)
+            })
+            print(f"[A2A]    ✅ {provider}/{model} → {len(html):,} chars in {duration}s")
+            return html
+
+        except Exception as e:
+            err      = str(e)
+            duration = round(time.time() - t, 1)
+            _mark_error(provider, err)
+            is_rl = any(x in err.lower() for x in ["429","quota","rate limit","too many","rate_limit"])
+            if is_rl:
+                ra = _parse_retry_after(err)
+                _mark_rate_limited(provider, ra)
+                log.append({
+                    "agent":    f"{provider} / {model}",
+                    "status":   "rate_limited",
+                    "reason":   f"Rate limited — cooldown {ra}s",
+                    "duration": duration, "chars": 0
+                })
+                return ""   # whole provider done
+            else:
+                log.append({
+                    "agent":    f"{provider} / {model}",
+                    "status":   "failed",
+                    "reason":   err[:120],
+                    "duration": duration, "chars": 0
+                })
+                continue    # try next model in same provider
+
+    return ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN ORCHESTRATOR
+# MAIN A2A PIPELINE — ALL 3 AGENTS COLLABORATE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_agent_chain(data: dict) -> dict:
     """
-    A2A smart chain:
-    - Tries each agent in priority order
-    - On rate limit → extracts retry-after → puts provider on cooldown
-      → immediately hands off to next available agent
-    - Provider auto-recovers after cooldown expires
-    - Passes partial HTML context to next agent if available
-    - Returns full result dict with execution logs for the UI
+    TRUE A2A PIPELINE — all 3 agents work together:
+
+    Stage 1 — GEMINI  : HTML Architect  → generates full structure
+    Stage 2 — GROQ    : CSS Stylist     → enhances styling on Stage 1 output
+    Stage 3 — OLLAMA  : Finalizer       → polishes & fixes Stage 2 output
+
+    If any stage fails / rate-limits → that stage is skipped,
+    next stage uses best available output so far.
+    Final result is the most refined HTML possible.
     """
-    logs = []
-    partial_html = ""
-    final_html = ""
-    used_agent = "none"
 
-    for agent in AGENT_CHAIN:
-        provider = agent["provider"]
-        name     = agent["name"]
-        role     = agent["role"]
-        icon     = agent["icon"]
+    pipeline_logs = []
+    stage_outputs = {}   # stage_name → html
 
-        # Check if provider is available (with auto-recovery)
-        if not _is_available(provider):
-            cd = agent_registry[provider]["cooldown_until"]
-            reason = f"On cooldown until {cd.strftime('%H:%M:%S') if cd else 'unknown'}"
-            logs.append({
-                "agent":    name,
-                "role":     role,
-                "icon":     icon,
-                "status":   "skipped",
-                "reason":   reason,
-                "duration": 0,
-                "chars":    0
-            })
-            print(f"[A2A] ⏭️  Skipping {name} — {reason}")
-            continue
+    # ── STAGE 1: GEMINI — Structure & Layout ─────────────────────────────
+    print("\n[A2A] ═══════════════════════════════════════")
+    print("[A2A] 🧠 STAGE 1: Gemini — HTML Architect")
+    print("[A2A] ═══════════════════════════════════════")
 
-        log_entry = {
-            "agent":    name,
-            "role":     role,
-            "icon":     icon,
-            "status":   "trying",
-            "reason":   "",
-            "duration": 0,
-            "chars":    0
-        }
-        logs.append(log_entry)
-        print(f"[A2A] {icon} Trying {name} ({role})...")
-        t_start = time.time()
+    stage1_log  = []
+    stage1_prompt = _prompt_agent1_structure(data)
+    stage1_html   = _try_provider("gemini", GEMINI_MODELS, stage1_prompt, stage1_log)
 
-        try:
-            # Build specialized prompt — pass partial to style agents
-            if provider in ("groq", "ollama") and partial_html:
-                prompt = agent["prompt_fn"](data, partial_html)
-            else:
-                prompt = agent["prompt_fn"](data)
+    pipeline_logs.append({
+        "stage":   "Stage 1 — HTML Architect",
+        "agent":   "Gemini",
+        "icon":    "🧠",
+        "role":    "Generates full HTML structure, layout, all sections",
+        "result":  "✅ Success" if stage1_html else "❌ Failed/Skipped",
+        "chars":   len(stage1_html),
+        "details": stage1_log
+    })
 
-            # Call the agent
-            if provider == "gemini":
-                raw = _call_gemini(agent["model"], prompt)
-            elif provider == "groq":
-                raw = _call_groq(agent["model"], prompt)
-            elif provider == "ollama":
-                raw = _call_ollama(agent["model"], prompt)
-            else:
-                raise ValueError(f"Unknown provider: {provider}")
+    if stage1_html:
+        stage_outputs["stage1"] = stage1_html
+        print(f"[A2A] 🧠 Stage 1 complete — {len(stage1_html):,} chars")
+    else:
+        print("[A2A] ⚠️ Stage 1 failed — Stage 2 will generate from scratch")
 
-            html     = _clean_html(raw)
-            duration = round(time.time() - t_start, 1)
+    # ── STAGE 2: GROQ — CSS Stylist ──────────────────────────────────────
+    print("\n[A2A] ═══════════════════════════════════════")
+    print("[A2A] ⚡ STAGE 2: Groq — CSS Stylist")
+    print("[A2A] ═══════════════════════════════════════")
 
-            if len(html) < 300:
-                raise ValueError(f"Output too short ({len(html)} chars)")
+    stage2_log    = []
+    best_so_far   = stage_outputs.get("stage1", "")
+    stage2_prompt = _prompt_agent2_style(data, best_so_far)
+    stage2_html   = _try_provider("groq", GROQ_MODELS, stage2_prompt, stage2_log)
 
-            # ✅ SUCCESS
-            _mark_success(provider)
-            log_entry.update({
-                "status":   "success",
-                "chars":    len(html),
-                "duration": duration
-            })
-            final_html = html
-            used_agent = name
-            print(f"[A2A] ✅ {name} succeeded — {len(html):,} chars in {duration}s")
-            break
+    pipeline_logs.append({
+        "stage":   "Stage 2 — CSS Stylist",
+        "agent":   "Groq",
+        "icon":    "⚡",
+        "role":    "Enhances CSS, adds animations, makes it visually stunning",
+        "result":  "✅ Success" if stage2_html else "❌ Failed/Skipped",
+        "chars":   len(stage2_html),
+        "details": stage2_log
+    })
 
-        except Exception as e:
-            err      = str(e)
-            duration = round(time.time() - t_start, 1)
-            _mark_error(provider, err)
+    if stage2_html:
+        stage_outputs["stage2"] = stage2_html
+        print(f"[A2A] ⚡ Stage 2 complete — {len(stage2_html):,} chars")
+    else:
+        print("[A2A] ⚠️ Stage 2 failed — using Stage 1 output for Stage 3")
 
-            is_rate_limit = any(
-                x in err.lower()
-                for x in ["429", "quota", "rate limit", "too many", "rate_limit"]
-            )
+    # ── STAGE 3: OLLAMA — Finalizer ──────────────────────────────────────
+    print("\n[A2A] ═══════════════════════════════════════")
+    print("[A2A] 🦙 STAGE 3: Ollama — Quality Finalizer")
+    print("[A2A] ═══════════════════════════════════════")
 
-            if is_rate_limit:
-                retry_after = _parse_retry_after(err)
-                _mark_rate_limited(provider, retry_after)
-                log_entry.update({
-                    "status":   "rate_limited",
-                    "reason":   f"Rate limited — cooldown {retry_after}s. Next agent taking over.",
-                    "duration": duration
-                })
-                print(f"[A2A] ⚠️  {name} rate limited → handing off to next agent")
-            else:
-                log_entry.update({
-                    "status":   "failed",
-                    "reason":   err[:150],
-                    "duration": duration
-                })
-                print(f"[A2A] ❌ {name} failed: {err[:80]}")
+    stage3_log    = []
+    best_so_far   = stage_outputs.get("stage2") or stage_outputs.get("stage1", "")
+    stage3_prompt = _prompt_agent3_refine(data, best_so_far)
+    stage3_html   = _try_provider("ollama", OLLAMA_MODELS, stage3_prompt, stage3_log)
 
-            continue
+    pipeline_logs.append({
+        "stage":   "Stage 3 — Quality Finalizer",
+        "agent":   "Ollama Cloud",
+        "icon":    "🦙",
+        "role":    "Polishes, fixes issues, adds JS interactions, production ready",
+        "result":  "✅ Success" if stage3_html else "❌ Failed/Skipped",
+        "chars":   len(stage3_html),
+        "details": stage3_log
+    })
 
-    if not final_html:
-        final_html = _fallback_html(data)
-        used_agent = "Static Fallback"
-        logs.append({
-            "agent":    "Static Fallback",
-            "role":     "Emergency fallback — all agents exhausted",
-            "icon":     "🆘",
-            "status":   "fallback",
-            "reason":   "All agents failed or rate limited",
-            "duration": 0,
-            "chars":    len(final_html)
-        })
+    if stage3_html:
+        stage_outputs["stage3"] = stage3_html
+        print(f"[A2A] 🦙 Stage 3 complete — {len(stage3_html):,} chars")
+
+    # ── Pick best available output ────────────────────────────────────────
+    final_html = (
+        stage_outputs.get("stage3") or
+        stage_outputs.get("stage2") or
+        stage_outputs.get("stage1") or
+        _fallback_html(data)
+    )
+
+    completed = [s for s in ["stage3","stage2","stage1"] if s in stage_outputs]
+    used_agents = {
+        "stage3": "All 3 Agents (Gemini→Groq→Ollama) ✨",
+        "stage2": "Gemini + Groq (Ollama skipped)",
+        "stage1": "Gemini only (Groq + Ollama skipped)",
+    }
+    used_label = used_agents.get(completed if completed else "", "Static Fallback")
+
+    print(f"\n[A2A] 🏁 Pipeline complete — {used_label}")
+    print(f"[A2A] 📄 Final output: {len(final_html):,} chars\n")
 
     return {
         "html":       final_html,
-        "agent_used": used_agent,
-        "logs":       logs,
-        "chars":      len(final_html)
+        "agent_used": used_label,
+        "logs":       pipeline_logs,
+        "chars":      len(final_html),
+        "stages":     stage_outputs
     }
 
 
@@ -477,18 +494,14 @@ body{{font-family:'Segoe UI',sans-serif;background:#f4f6f8;padding:40px}}
        padding:48px;box-shadow:0 10px 40px rgba(0,0,0,.08)}}
 h1{{font-size:2.2rem;color:#333;margin-bottom:12px}}
 p{{color:#666;line-height:1.8;margin-bottom:20px}}
-.warn{{background:#fff8e1;border-left:4px solid #ffc107;
-       border-radius:8px;padding:16px;color:#856404}}
+.warn{{background:#fff8e1;border-left:4px solid #ffc107;border-radius:8px;padding:16px;color:#856404}}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>{data['title']}</h1>
   <p>{data['meta_desc'] or 'No description available.'}</p>
-  <div class="warn">
-    ⚠️ All AI agents exhausted. Please wait a few minutes and try again,
-    or check your API keys in the .env file.
-  </div>
+  <div class="warn">⚠️ All AI agents exhausted. Please wait and try again.</div>
 </div>
 </body>
 </html>"""
