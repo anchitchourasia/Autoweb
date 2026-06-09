@@ -26,7 +26,8 @@ def render_preview(clone_html, data, shot_path,
 
     # ── Tab 1: Clone Preview ──────────────────────────────────────────────
     with tab1:
-        col_dl, col_info = st.columns()[3][4]
+        # FIXED
+        col_dl, col_info = st.columns([2, 5])[3][4]
         with col_dl:
             st.download_button(
                 label="⬇️ Download HTML",

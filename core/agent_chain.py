@@ -453,6 +453,7 @@ def run_agent_chain(data: dict) -> dict:
         print(f"[A2A] 🦙 Stage 3 complete — {len(stage3_html):,} chars")
 
     # ── Pick best available output ────────────────────────────────────────
+        # ── Pick best available output ────────────────────────────────────────
     final_html = (
         stage_outputs.get("stage3") or
         stage_outputs.get("stage2") or
@@ -460,13 +461,14 @@ def run_agent_chain(data: dict) -> dict:
         _fallback_html(data)
     )
 
-    completed = [s for s in ["stage3","stage2","stage1"] if s in stage_outputs]
+    completed = [s for s in ["stage3", "stage2", "stage1"] if s in stage_outputs]
     used_agents = {
-        "stage3": "All 3 Agents (Gemini→Groq→Ollama) ✨",
-        "stage2": "Gemini + Groq (Ollama skipped)",
-        "stage1": "Gemini only (Groq + Ollama skipped)",
+        "stage3": "🧠⚡🦙 All 3 Agents Collaborated (Gemini→Groq→Ollama)",
+        "stage2": "🧠⚡ Gemini + Groq (Ollama skipped)",
+        "stage1": "🧠 Gemini only (Groq + Ollama skipped)",
     }
-    used_label = used_agents.get(completed if completed else "", "Static Fallback")
+    # ✅ FIX: completed[0] not completed
+    used_label = used_agents.get(completed[0] if completed else "", "Static Fallback")
 
     print(f"\n[A2A] 🏁 Pipeline complete — {used_label}")
     print(f"[A2A] 📄 Final output: {len(final_html):,} chars\n")
