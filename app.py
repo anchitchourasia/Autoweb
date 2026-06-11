@@ -89,7 +89,7 @@ if generate:
 
         with st.spinner("🧠 Stage 1/3 — Gemini building structure..."):
             progress.progress(40, text="🧠 Stage 1: Gemini — HTML Architect...")
-            result = generate_clone_html(data)
+            result = generate_clone_html(data, shot_path=shot_path or "")
             progress.progress(100, text="✅ All agents done!")
 
         progress.empty()

@@ -8,7 +8,7 @@ def render_preview(clone_html, data, shot_path,
                    agent_used="", agent_logs=None, chars=0):
 
     if isinstance(clone_html, tuple):
-        clone_html = clone_html
+        clone_html = clone_html[0]
 
     if not clone_html or len(clone_html) < 100:
         st.error("⚠️ Clone HTML is empty. Check API keys and try again.")
@@ -24,22 +24,18 @@ def render_preview(clone_html, data, shot_path,
         "🤖 Agent Pipeline"
     ])
 
-    # ── Tab 1: Clone Preview ──────────────────────────────────────────────
     with tab1:
-        # FIXED
-        col_dl, col_info = st.columns([2, 5])[3][4]
+        col_dl, col_info = st.columns([2, 5])
         with col_dl:
             st.download_button(
                 label="⬇️ Download HTML",
                 data=clone_html,
                 file_name="clone.html",
-                mime="text/html",
-                use_container_width=False
+                mime="text/html"
             )
         with col_info:
             st.caption(f"📄 {chars:,} chars | {agent_used}")
 
-        # base64 iframe — most reliable cross-platform render
         encoded = base64.b64encode(clone_html.encode("utf-8")).decode("utf-8")
         st.markdown(
             f'<iframe src="data:text/html;base64,{encoded}" '
@@ -55,14 +51,12 @@ def render_preview(clone_html, data, shot_path,
             if len(clone_html) > 6000:
                 st.caption(f"... {len(clone_html)-6000:,} more chars")
 
-    # ── Tab 2: Screenshot ─────────────────────────────────────────────────
     with tab2:
         if shot_path and os.path.exists(shot_path):
             st.image(shot_path, use_container_width=True)
         else:
             st.info("📸 Screenshot unavailable.")
 
-    # ── Tab 3: Extracted Data ─────────────────────────────────────────────
     with tab3:
         st.markdown("### 📋 Page Analysis")
         col1, col2 = st.columns(2)
@@ -88,18 +82,18 @@ def render_preview(clone_html, data, shot_path,
 
             st.markdown("**📏 Stats**")
             st.markdown(f"""
-- HTML fetched: `{data.get('html_length',0):,}` bytes
+- HTML fetched: `{data.get('html_length', 0):,}` bytes
 - Clone size: `{chars:,}` chars
-- Headings: `{len(data.get('headings',[]))}`
-- Nav links: `{len(data.get('nav_links',[]))}`
-- Buttons: `{len(data.get('buttons',[]))}`
+- Headings: `{len(data.get('headings', []))}`
+- Nav links: `{len(data.get('nav_links', []))}`
+- Buttons: `{len(data.get('buttons', []))}`
 """)
 
         with col2:
             st.markdown("**📌 Headings**")
             for h in data.get("headings", [])[:12]:
                 tag = h["tag"].upper()
-                c   = {"H1":"#667eea","H2":"#764ba2","H3":"#9e9e9e"}.get(tag,"#333")
+                c   = {"H1": "#667eea", "H2": "#764ba2", "H3": "#9e9e9e"}.get(tag, "#333")
                 st.markdown(
                     f"<div style='margin-bottom:5px'>"
                     f"<span style='background:{c};color:white;padding:2px 7px;"
@@ -115,14 +109,10 @@ def render_preview(clone_html, data, shot_path,
         if link_data:
             st.dataframe(link_data, use_container_width=True, height=250)
 
-    # ── Tab 4: A2A Pipeline Logs ──────────────────────────────────────────
     with tab4:
         st.markdown("### 🤖 A2A Collaborative Pipeline")
-        st.markdown(
-            "**All 3 agents work together** — each builds on the previous agent's output."
-        )
+        st.markdown("**All 3 agents work together** — each builds on the previous agent's output.")
 
-        # Pipeline flow diagram
         st.markdown("""
 <div style='background:#f8f9ff;border-radius:14px;padding:20px;
             text-align:center;margin-bottom:20px;font-size:.95rem'>
@@ -139,50 +129,46 @@ def render_preview(clone_html, data, shot_path,
             return
 
         stage_colors = {
-            "✅ Success":          ("#e8f5e9", "#4caf50"),
-            "❌ Failed/Skipped":   ("#ffebee", "#f44336"),
+            "✅ Success":        ("#e8f5e9", "#4caf50"),
+            "❌ Failed/Skipped": ("#ffebee", "#f44336"),
         }
 
         for stage_log in agent_logs:
             result  = stage_log.get("result", "")
             bg, bdr = stage_colors.get(result, ("#f5f5f5", "#9e9e9e"))
             chars_n = stage_log.get("chars", 0)
-
             st.markdown(
                 f"<div style='background:{bg};border-left:5px solid {bdr};"
                 f"border-radius:12px;padding:16px;margin-bottom:12px'>"
                 f"<b>{stage_log.get('icon','')} {stage_log.get('stage','')}</b> "
                 f"— {stage_log.get('agent','')} &nbsp; {result}<br>"
-                f"<span style='font-size:.83rem;color:#555'>"
-                f"{stage_log.get('role','')}</span>"
-                + (f"<br><span style='font-size:.8rem;color:#888'>"
-                   f"Output: {chars_n:,} chars</span>" if chars_n else "") +
+                f"<span style='font-size:.83rem;color:#555'>{stage_log.get('role','')}</span>"
+                + (f"<br><span style='font-size:.8rem;color:#888'>Output: {chars_n:,} chars</span>"
+                   if chars_n else "") +
                 f"</div>",
                 unsafe_allow_html=True
             )
-
-            # Show sub-model attempts
             for attempt in stage_log.get("details", []):
-                s  = attempt.get("status","")
-                ic = {"success":"✅","failed":"❌","rate_limited":"⚠️",
-                      "skipped":"⏭️"}.get(s,"❓")
+                s      = attempt.get("status", "")
+                ic     = {"success": "✅", "failed": "❌",
+                          "rate_limited": "⚠️", "skipped": "⏭️"}.get(s, "❓")
+                reason = attempt.get("reason", "")
                 st.markdown(
                     f"&nbsp;&nbsp;&nbsp; {ic} `{attempt.get('agent','')}` — "
-                    f"**{s}** "
-                    f"({attempt.get('duration',0)}s"
-                    + (f", {attempt.get('chars',0):,} chars" if attempt.get('chars') else "") +
-                    f") "
-                    + (f"<span style='color:#888;font-size:.8rem'>{attempt.get('reason','')}</span>" if attempt.get('reason') else ""),
+                    f"**{s}** ({attempt.get('duration', 0)}s"
+                    + (f", {attempt.get('chars', 0):,} chars" if attempt.get("chars") else "")
+                    + ")"
+                    + (f" <span style='color:#888;font-size:.8rem'>{reason}</span>"
+                       if reason else ""),
                     unsafe_allow_html=True
                 )
 
-        # Live health
         st.markdown("---")
         st.markdown("### 🏥 Live Agent Health")
-        registry = get_agent_status()
-        cols     = st.columns(3)
-        for i, (provider, s) in enumerate(registry.items()):
-            with cols[i]:
+        registry   = get_agent_status()
+        h1, h2, h3 = st.columns(3)
+        for col, (provider, s) in zip([h1, h2, h3], registry.items()):
+            with col:
                 avail = s["available"]
                 cd    = s["cooldown_until"]
                 st.markdown(
