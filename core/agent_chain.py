@@ -4,6 +4,7 @@ import json
 import time
 import threading
 import base64
+from collections import Counter
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -41,14 +42,16 @@ _rl_memory: dict = {}
 def _reset_rl_memory():
     global _rl_memory
     _rl_memory = {
-        "ollama_mistakes":     [],   # HTML structure problems Ollama made
-        "groq_mistakes":       [],   # CSS problems Groq made
-        "gemini_actions":      [],   # direct fixes supervisor applied
-        "successful_patterns": [],   # what worked well (keep these)
-        "failed_approaches":   [],   # approaches that didn't help
-        "round_scores":        [],   # total score per round
-        "score_breakdown":     [],   # per-round dict of dimension scores
-        "handoffs":            [],   # when a worker failed and Gemini covered
+        "ollama_mistakes":     [],
+        "groq_mistakes":       [],
+        "gemini_actions":      [],
+        "successful_patterns": [],
+        "failed_approaches":   [],
+        "round_scores":        [],
+        "score_breakdown":     [],
+        "handoffs":            [],
+        "persistent_issues":   [],   # NEW: tracks repeated issues across rounds
+        "issue_frequency":     {},   # NEW: Counter of how many rounds each issue appeared
         "best_html":           "",
         "best_score":          0,
         "best_round":          0,
@@ -61,7 +64,7 @@ def _is_available(p: str) -> bool:
         if s["available"]:
             return True
         if s["cooldown_until"] and datetime.now() >= s["cooldown_until"]:
-            s["available"]     = True
+            s["available"]      = True
             s["cooldown_until"] = None
             print(f"[A2A] 🔄 {p} recovered.")
             return True
@@ -71,7 +74,7 @@ def _is_available(p: str) -> bool:
 def _mark_rate_limited(p: str, secs: int = 60):
     with _lock:
         s = agent_registry[p]
-        s["available"]     = False
+        s["available"]      = False
         s["cooldown_until"] = datetime.now() + timedelta(seconds=secs)
         s["errors"]        += 1
         print(f"[A2A] ⏳ {p} rate-limited — cooldown {secs}s")
@@ -85,8 +88,8 @@ def _mark_success(p: str):
 
 def _mark_error(p: str, err: str):
     with _lock:
-        agent_registry[p]["errors"]     += 1
-        agent_registry[p]["last_error"]  = err[:300]
+        agent_registry[p]["errors"]    += 1
+        agent_registry[p]["last_error"] = err[:300]
 
 
 def get_agent_status() -> dict:
@@ -106,7 +109,8 @@ def _parse_retry(err: str) -> int:
 # LOW-LEVEL API CALLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_gemini(model: str, prompt: str, image_b64: str = None) -> str:
+def _call_gemini(model: str, prompt: str, image_b64: str = None,
+                 temperature: float = 0.15) -> str:
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -118,12 +122,13 @@ def _call_gemini(model: str, prompt: str, image_b64: str = None) -> str:
     response = client.models.generate_content(
         model=model,
         contents=[types.Content(role="user", parts=parts)],
-        config=types.GenerateContentConfig(temperature=0.15, max_output_tokens=8192)
+        config=types.GenerateContentConfig(
+            temperature=temperature, max_output_tokens=8192)
     )
     return response.text.strip()
 
 
-def _call_groq(model: str, prompt: str) -> str:
+def _call_groq(model: str, prompt: str, temperature: float = 0.15) -> str:
     from groq import Groq
     r = Groq(api_key=os.getenv("GROQ_API_KEY")).chat.completions.create(
         model=model,
@@ -135,7 +140,7 @@ def _call_groq(model: str, prompt: str) -> str:
              "Return ONLY raw HTML starting with <!doctype html>. Absolutely no markdown."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.15, max_tokens=8192
+        temperature=temperature, max_tokens=8192
     )
     return r.choices[0].message.content.strip()
 
@@ -164,12 +169,37 @@ def _call_ollama(model: str, prompt: str) -> str:
 
 def _clean_html(text: str) -> str:
     text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```\s*$",        "", text)
+    # ── FIX: strip markdown fences Gemini sometimes wraps around JSON/HTML ──
+    text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+    text = re.sub(r"\n?```\s*$",        "", text)
+    text = text.strip()
     if "<!doctype" not in text.lower() and "<html" not in text.lower():
         return ""
-    return text.strip()
+    return text
+
+
+def _safe_parse_json(raw: str) -> dict:
+    """
+    Robust JSON parser — strips markdown fences, fixes common Gemini
+    formatting issues before attempting json.loads().
+    NEW: replaces the bare re.search + json.loads pattern everywhere.
+    """
+    # Strip code fences
+    raw = re.sub(r"```json\s*", "", raw)
+    raw = re.sub(r"```\s*",     "", raw)
+    raw = raw.strip()
+    # Extract first {...} block
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    candidate = m.group(0) if m else raw
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        # Last resort: try json-repair if installed
+        try:
+            from json_repair import repair_json
+            return json.loads(repair_json(candidate))
+        except Exception:
+            raise
 
 
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-1.5-flash"]
@@ -177,13 +207,14 @@ GROQ_MODELS   = ["llama-3.3-70b-versatile", "llama3-70b-8192"]
 OLLAMA_MODELS = ["gpt-oss:120b-cloud", "qwen3.5", "deepseek-v4-flash"]
 
 
-def _safe_gemini(prompt: str, image_b64: str = None) -> str:
+def _safe_gemini(prompt: str, image_b64: str = None,
+                 temperature: float = 0.15) -> str:
     for model in GEMINI_MODELS:
         if not _is_available("gemini"):
             break
         try:
             t   = time.time()
-            out = _call_gemini(model, prompt, image_b64)
+            out = _call_gemini(model, prompt, image_b64, temperature)
             _mark_success("gemini")
             print(f"[GEMINI] ✅ {model} → {len(out):,} chars in {round(time.time()-t,1)}s")
             return out
@@ -203,7 +234,7 @@ def _safe_gemini(prompt: str, image_b64: str = None) -> str:
 def supervisor_deep_analyze(data: dict, image_b64: str) -> dict:
     """
     Gemini visually dissects the screenshot at pixel level.
-    Produces a precise 12-field replication blueprint for workers.
+    Produces a precise blueprint for workers including new navbar_icons field.
     """
     prompt = f"""You are GEMINI SUPERVISOR with advanced computer vision.
 Analyze this website screenshot with EXTREME precision. Every pixel matters.
@@ -235,16 +266,19 @@ Analyze the screenshot and return ONLY this JSON — no other text:
     "footer_bg":  "#hex"
   }},
   "navbar": {{
-    "background":        "exact CSS value",
-    "has_backdrop_blur": true,
-    "position":          "sticky|fixed|relative",
-    "height":            "approx px",
-    "logo_text":         "exact logo text",
-    "logo_has_icon":     true,
-    "nav_links":         ["link1","link2"],
-    "cta_text":          "exact CTA text",
-    "cta_bg":            "#hex",
-    "cta_text_color":    "#hex"
+    "background":             "exact CSS value",
+    "has_backdrop_blur":      true,
+    "position":               "sticky|fixed|relative",
+    "height":                 "approx px",
+    "logo_text":              "exact logo text",
+    "logo_has_icon":          true,
+    "nav_links":              ["link1","link2"],
+    "navbar_icons":           ["list every icon visible e.g. search, github, twitter, theme-toggle, version-dropdown"],
+    "navbar_search_placeholder": "exact placeholder text e.g. Search (Ctrl K)",
+    "navbar_version_dropdown":   "e.g. v5.3",
+    "cta_text":               "exact CTA text",
+    "cta_bg":                 "#hex",
+    "cta_text_color":         "#hex"
   }},
   "hero": {{
     "layout":             "center|left|split",
@@ -257,9 +291,13 @@ Analyze the screenshot and return ONLY this JSON — no other text:
     "headline_color":     "#hex",
     "subtext":            "first 80 chars of subtext",
     "subtext_color":      "#hex",
+    "has_announcement_banner": false,
+    "announcement_banner_text": "exact banner text if present",
+    "announcement_banner_color": "#hex",
     "has_code_snippet":   false,
     "code_snippet_text":  "exact code text e.g. $ npm i bootstrap@5.3.8",
-    "code_snippet_style": "describe appearance",
+    "code_snippet_bg":    "#hex e.g. #f8f9fa for light or #1e1e2e for dark",
+    "code_snippet_style": "light|dark",
     "cta_buttons": [
       {{"text":"btn text","bg":"#hex","text_color":"#hex","border":"none","icon":"description"}}
     ],
@@ -293,8 +331,8 @@ Analyze the screenshot and return ONLY this JSON — no other text:
     "navbar_height":     "px"
   }},
   "footer": {{
-    "bg":       "#hex",
-    "color":    "#hex",
+    "bg":        "#hex",
+    "color":     "#hex",
     "has_links": true
   }},
   "special_elements":        ["describe each unique UI element visible"],
@@ -303,8 +341,7 @@ Analyze the screenshot and return ONLY this JSON — no other text:
 
     try:
         raw = _safe_gemini(prompt, image_b64)
-        m   = re.search(r"\{.*\}", raw, re.DOTALL)
-        bp  = json.loads(m.group(0) if m else raw)
+        bp  = _safe_parse_json(raw)
         print(f"[SUPERVISOR] ✅ Blueprint: {len(bp)} fields extracted")
         return bp
     except Exception as e:
@@ -314,14 +351,14 @@ Analyze the screenshot and return ONLY this JSON — no other text:
             "background": {
                 "type": "gradient",
                 "css":  "linear-gradient(135deg, #e0d7ff 0%, #fde8d0 100%)",
-                "gradient_from":      c if len(c) > 0 else "#e0d7ff",
+                "gradient_from":      c[0] if len(c) > 0 else "#e0d7ff",
                 "gradient_to":        c[1] if len(c) > 1 else "#fde8d0",
                 "gradient_direction": "135deg"
             },
             "color_scheme": {
-                "primary":    c if len(c) > 0 else "#7952b3",
-                "secondary":  c if len(c) > 1 else "#6610f2",
-                "accent":     c if len(c) > 2 else "#7952b3",
+                "primary":    c[0] if len(c) > 0 else "#7952b3",
+                "secondary":  c[1] if len(c) > 1 else "#6610f2",
+                "accent":     c[2] if len(c) > 2 else "#7952b3",
                 "background": "#ffffff",
                 "text_dark":  "#212529",
                 "text_light": "#6c757d",
@@ -334,8 +371,11 @@ Analyze the screenshot and return ONLY this JSON — no other text:
                 "position": "sticky", "height": "60px",
                 "logo_text": data.get("title", "Site")[:20], "logo_has_icon": True,
                 "nav_links": [l["text"] for l in data.get("nav_links", [])[:6]],
+                "navbar_icons": ["search", "github", "theme-toggle"],
+                "navbar_search_placeholder": "Search",
+                "navbar_version_dropdown": "",
                 "cta_text": "Get started",
-                "cta_bg": c if len(c) > 0 else "#7952b3",
+                "cta_bg": c[0] if len(c) > 0 else "#7952b3",
                 "cta_text_color": "#fff"
             },
             "hero": {
@@ -347,10 +387,13 @@ Analyze the screenshot and return ONLY this JSON — no other text:
                 "headline_color": "#212529",
                 "subtext": data.get("meta_desc", "")[:120],
                 "subtext_color": "#6c757d",
+                "has_announcement_banner": False,
+                "announcement_banner_text": "",
+                "announcement_banner_color": "#fff3cd",
                 "has_code_snippet": False, "code_snippet_text": "",
-                "code_snippet_style": "",
+                "code_snippet_bg": "#f8f9fa", "code_snippet_style": "light",
                 "cta_buttons": [{"text": "Get started",
-                                  "bg": c if len(c) > 0 else "#7952b3",
+                                  "bg": c[0] if len(c) > 0 else "#7952b3",
                                   "text_color": "#fff", "border": "none", "icon": ""}],
                 "version_badge": "", "padding_top": "80px"
             },
@@ -360,7 +403,7 @@ Analyze the screenshot and return ONLY this JSON — no other text:
                 "card_bg": "#ffffff", "card_radius": "12px",
                 "card_shadow": "0 4px 20px rgba(0,0,0,0.08)",
                 "card_padding": "32px", "card_has_icon": True,
-                "card_icon_color": c if len(c) > 0 else "#7952b3"
+                "card_icon_color": c[0] if len(c) > 0 else "#7952b3"
             },
             "typography": {
                 "font_import":    "https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap",
@@ -387,6 +430,21 @@ Analyze the screenshot and return ONLY this JSON — no other text:
 # WORKER PROMPT BUILDERS — inject full RL memory every round
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _adaptive_temperature(round_num: int, current_score: int) -> float:
+    """
+    Increase temperature slightly each round if score is stuck,
+    to encourage exploration over repetition.
+    """
+    base = 0.15
+    if round_num <= 2:
+        return base
+    # Escalate if score hasn't improved much
+    scores = _rl_memory.get("round_scores", [])
+    if len(scores) >= 2 and scores[-1] <= scores[-2]:
+        return min(base + (round_num * 0.05), 0.40)
+    return base + (round_num * 0.02)
+
+
 def _build_ollama_prompt(data: dict, bp: dict, round_num: int,
                           corrections: str = "") -> str:
     nl = "\n"
@@ -410,6 +468,12 @@ def _build_ollama_prompt(data: dict, bp: dict, round_num: int,
         + "\n"
     ) if _rl_memory.get("handoffs") else ""
 
+    persistent_block = (
+        f"\n=== 🔁 PERSISTENT ISSUES (SUPERVISOR FLAGGED {round_num-1}+ ROUNDS) ===\n"
+        + nl.join(f"  ⚠️ {issue}" for issue in _rl_memory.get("persistent_issues", []))
+        + "\nThese MUST be fixed this round — supervisor will directly patch if missed again.\n"
+    ) if _rl_memory.get("persistent_issues") else ""
+
     score_hist     = " → ".join(str(s) for s in _rl_memory.get("round_scores", []))
     correction_blk = (
         f"\n=== 📌 SUPERVISOR CORRECTIONS (Round {round_num}) ===\n{corrections}\n"
@@ -424,10 +488,24 @@ def _build_ollama_prompt(data: dict, bp: dict, round_num: int,
     space  = bp.get("spacing",     {})
     footer = bp.get("footer",      {})
 
+    # Build navbar icons HTML hint
+    icons = nav.get("navbar_icons", [])
+    icon_hint = ""
+    if icons:
+        icon_hint = f"\n  icons:      {json.dumps(icons)} — build each as inline SVG or Unicode symbol"
+    version_dd = nav.get("navbar_version_dropdown", "")
+    version_hint = f'\n  version dropdown: "{version_dd}" — build as <span> with dropdown arrow ▾' if version_dd else ""
+    search_hint = f'\n  search box: placeholder="{nav.get("navbar_search_placeholder","Search")}" — include Ctrl K hint span'
+
+    # Build announcement banner hint
+    banner_hint = ""
+    if hero.get("has_announcement_banner"):
+        banner_hint = f'\n  announcement banner: "{hero.get("announcement_banner_text","")}" bg={hero.get("announcement_banner_color","#fff3cd")} — build ABOVE hero content'
+
     return f"""You are the HTML STRUCTURE WORKER (Ollama) — Round {round_num}/{MAX_ROUNDS}.
 TARGET: Reach {APPROVAL_THRESHOLD}% visual match vs original screenshot.
 Score history: {score_hist or 'Round 1 — no history yet'}
-{mistakes_block}{wins_block}{handoff_block}{correction_blk}
+{mistakes_block}{wins_block}{handoff_block}{persistent_block}{correction_blk}
 
 ══ PIXEL-PERFECT VISUAL BLUEPRINT ══
 
@@ -446,16 +524,16 @@ NAVBAR:
   blur:       {nav.get('has_backdrop_blur')}
   height:     {nav.get('height')}
   logo:       "{nav.get('logo_text')}"  icon={nav.get('logo_has_icon')}
-  links:      {json.dumps(nav.get('nav_links', []))}
+  links:      {json.dumps(nav.get('nav_links', []))}{icon_hint}{search_hint}{version_hint}
   cta:        "{nav.get('cta_text')}" bg={nav.get('cta_bg')}
 
-HERO:
+HERO:{banner_hint}
   layout:        {hero.get('layout')}
   logo icon:     {hero.get('has_logo_icon')} — {hero.get('logo_icon_shape')} size={hero.get('logo_icon_size')}
   headline:      "{hero.get('headline')}"
   headline:      {hero.get('headline_font_size')} / weight={hero.get('headline_weight')} / color={hero.get('headline_color')}
   subtext:       "{hero.get('subtext')}"
-  code snippet:  {hero.get('has_code_snippet')} — "{hero.get('code_snippet_text')}" style="{hero.get('code_snippet_style')}"
+  code snippet:  {hero.get('has_code_snippet')} — "{hero.get('code_snippet_text')}" style={hero.get('code_snippet_style','light')} bg={hero.get('code_snippet_bg','#f8f9fa')}
   cta buttons:   {json.dumps(hero.get('cta_buttons', []))}
   version badge: "{hero.get('version_badge')}"
 
@@ -488,14 +566,17 @@ CONTENT:  {data['text'][:2500]}
 1. Build ALL sections IN ORDER: {json.dumps(bp.get('sections_order', ['navbar','hero','features','footer']))}
 2. CSS class names: .navbar .hero .hero-logo .hero-code .features-grid .card .footer
 3. Embed full <style> block with :root CSS variables
-4. If code snippet visible → build exact styled <pre><code> block
-5. If logo icon → build a CSS-only styled div (no external images for icons)
-6. Placeholder images: https://placehold.co/600x400
-7. Return ONLY <!doctype html>...</html> — ZERO markdown, ZERO explanations"""
+4. If announcement banner → build <div class="announcement-banner"> ABOVE .hero
+5. If code snippet visible → build exact styled <pre><code> block with correct bg color
+6. If logo icon → build a CSS-only styled div (no external images for icons)
+7. Navbar icons (search, github, twitter, theme, version) → build each as inline SVG or text symbol
+8. Placeholder images: https://placehold.co/600x400
+9. Return ONLY <!doctype html>...</html> — ZERO markdown, ZERO explanations"""
 
 
 def _build_groq_prompt(data: dict, bp: dict, ollama_html: str,
-                        round_num: int, corrections: str = "") -> str:
+                        round_num: int, corrections: str = "",
+                        temperature: float = 0.15) -> str:
     nl = "\n"
 
     mistakes_block = (
@@ -511,6 +592,12 @@ def _build_groq_prompt(data: dict, bp: dict, ollama_html: str,
         + "\n"
     ) if _rl_memory.get("successful_patterns") else ""
 
+    persistent_block = (
+        f"\n=== 🔁 PERSISTENT CSS ISSUES (KEEP MISSING THESE) ===\n"
+        + nl.join(f"  ⚠️ {issue}" for issue in _rl_memory.get("persistent_issues", []))
+        + "\n"
+    ) if _rl_memory.get("persistent_issues") else ""
+
     score_hist     = " → ".join(str(s) for s in _rl_memory.get("round_scores", []))
     correction_blk = (
         f"\n=== 📌 SUPERVISOR CSS CORRECTIONS (Round {round_num}) ===\n{corrections}\n"
@@ -525,10 +612,14 @@ def _build_groq_prompt(data: dict, bp: dict, ollama_html: str,
     footer = bp.get("footer",      {})
     nav    = bp.get("navbar",      {})
 
+    code_bg = hero.get("code_snippet_bg", "#f8f9fa")
+    code_style = hero.get("code_snippet_style", "light")
+    code_color = "#212529" if code_style == "light" else "#cdd6f4"
+
     return f"""You are the CSS STYLING WORKER (Groq) — Round {round_num}/{MAX_ROUNDS}.
 TARGET: Reach {APPROVAL_THRESHOLD}% visual match vs original screenshot.
 Score history: {score_hist or 'Round 1 — no history yet'}
-{mistakes_block}{wins_block}{correction_blk}
+{mistakes_block}{wins_block}{persistent_block}{correction_blk}
 
 ══ EXACT SPECS TO MATCH ══
 
@@ -552,6 +643,7 @@ CONTAINER MAX-W: {space.get('container_max_w', '1200px')}
 NAVBAR:          bg={nav.get('background','rgba(255,255,255,0.9)')} blur={nav.get('has_backdrop_blur',True)} height={nav.get('height','60px')}
 CARD:            bg={feats.get('card_bg','#fff')} radius={feats.get('card_radius','12px')} shadow="{feats.get('card_shadow','0 4px 20px rgba(0,0,0,0.08)')}"
 FOOTER:          bg={footer.get('bg','#212529')} color={footer.get('color','#adb5bd')}
+CODE BLOCK:      bg={code_bg} color={code_color} — {code_style} theme
 
 ══ OLLAMA'S HTML (apply complete CSS to this) ══
 {ollama_html[:5500]}
@@ -563,15 +655,17 @@ FOOTER:          bg={footer.get('bg','#212529')} color={footer.get('color','#adb
 4. html {{ scroll-behavior: smooth; }}
 5. body: gradient background, min-height 100vh, font-family set
 6. .navbar: position {nav.get('position','sticky')} top-0, z-index 1000, {'backdrop-filter: blur(12px);' if nav.get('has_backdrop_blur') else ''}
-7. .hero: padding-top {hero.get('padding_top','80px')}, text-align {hero.get('layout','center')}
-8. .hero-headline: font-size {typo.get('hero_size','64px')}, font-weight {hero.get('headline_weight','700')}
-9. .hero-code: styled code block if site has one (dark bg #1e1e2e, monospace, border-radius 8px)
-10. .features-grid: display grid, grid-template-columns repeat({feats.get('card_count',3)},1fr), gap 24px
-11. .card {{ transition: transform 0.2s, box-shadow 0.2s; }}
+7. .navbar-icons: display flex, align-items center, gap 12px — each icon 20px
+8. .announcement-banner: background {hero.get('announcement_banner_color','#fff3cd')}, text-align center, padding 8px 0, font-size 14px
+9. .hero: padding-top {hero.get('padding_top','80px')}, text-align {hero.get('layout','center')}
+10. .hero-headline: font-size {typo.get('hero_size','64px')}, font-weight {hero.get('headline_weight','700')}
+11. .hero-code: background {code_bg}, color {code_color}, font-family monospace, border-radius 8px, padding 16px 24px, display inline-block
+12. .features-grid: display grid, grid-template-columns repeat({feats.get('card_count',3)},1fr), gap 24px
+13. .card {{ transition: transform 0.2s, box-shadow 0.2s; }}
     .card:hover {{ transform: translateY(-6px); box-shadow: 0 16px 48px rgba(0,0,0,0.18); }}
-12. @keyframes fadeInUp — apply staggered to .hero > * children
-13. @media (max-width:768px): grids → 1 col, hero font 36px, navbar links hidden
-14. Buttons: border-radius 8px, padding 12px 28px, cursor pointer, transition
+14. @keyframes fadeInUp — apply staggered to .hero > * children
+15. @media (max-width:768px): grids → 1 col, hero font 36px, navbar links hidden
+16. Buttons: border-radius 8px, padding 12px 28px, cursor pointer, transition
 
 Return the COMPLETE HTML with your new <style> replacing old one. Start <!doctype html>. ZERO markdown."""
 
@@ -581,10 +675,6 @@ Return the COMPLETE HTML with your new <style> replacing old one. Start <!doctyp
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_ollama_with_handoff(prompt: str, round_num: int) -> tuple:
-    """
-    Runs Ollama for HTML. If unavailable, Gemini supervisor covers the task.
-    Returns (html, model_used, agent_name, duration_s)
-    """
     for model in OLLAMA_MODELS:
         if not _is_available("ollama"):
             break
@@ -604,7 +694,6 @@ def _run_ollama_with_handoff(prompt: str, round_num: int) -> tuple:
                 _mark_rate_limited("ollama", _parse_retry(err))
                 break
 
-    # ── HANDOFF: Gemini covers Ollama's HTML task ──
     print(f"[SUPERVISOR] 🤝 Ollama unavailable R{round_num} — Gemini taking over HTML task")
     _rl_memory["handoffs"].append(f"R{round_num}: Gemini covered Ollama HTML task")
     t    = time.time()
@@ -616,17 +705,14 @@ def _run_ollama_with_handoff(prompt: str, round_num: int) -> tuple:
 
 
 def _run_groq_with_handoff(prompt: str, ollama_html: str,
-                             round_num: int, bp: dict) -> tuple:
-    """
-    Runs Groq for CSS. If unavailable, Gemini supervisor covers the styling task.
-    Returns (html, model_used, agent_name, duration_s)
-    """
+                             round_num: int, bp: dict,
+                             temperature: float = 0.15) -> tuple:
     for model in GROQ_MODELS:
         if not _is_available("groq"):
             break
         try:
             t    = time.time()
-            raw  = _call_groq(model, prompt)
+            raw  = _call_groq(model, prompt, temperature)
             html = _clean_html(raw)
             if len(html) > 500:
                 _mark_success("groq")
@@ -640,7 +726,6 @@ def _run_groq_with_handoff(prompt: str, ollama_html: str,
                 _mark_rate_limited("groq", _parse_retry(err))
                 break
 
-    # ── HANDOFF: Gemini covers Groq's CSS task ──
     print(f"[SUPERVISOR] 🤝 Groq unavailable R{round_num} — Gemini taking over CSS task")
     _rl_memory["handoffs"].append(f"R{round_num}: Gemini covered Groq CSS styling task")
     bg     = bp.get("background",  {})
@@ -668,13 +753,6 @@ Return full HTML. No markdown."""
 
 def supervisor_strict_score(data: dict, bp: dict, html: str,
                               image_b64: str, round_num: int) -> dict:
-    """
-    Gemini does STRICT visual comparison against the original screenshot.
-    Scores 10 dimensions (10 pts each = 100 total).
-    Approved ONLY if total >= APPROVAL_THRESHOLD (90).
-    Produces per-worker actionable RL corrections.
-    Can flag if supervisor should directly patch something.
-    """
     prev_scores = _rl_memory.get("round_scores", [])
     score_trend = " → ".join(str(s) for s in prev_scores) if prev_scores else "First round"
 
@@ -685,18 +763,23 @@ Score with NO mercy. Threshold to approve: {APPROVAL_THRESHOLD}/100.
 Score trend: {score_trend}
 Ollama known mistakes: {json.dumps(_rl_memory.get('ollama_mistakes', [])[-4:])}
 Groq known mistakes:   {json.dumps(_rl_memory.get('groq_mistakes',   [])[-4:])}
+Persistent issues:     {json.dumps(_rl_memory.get('persistent_issues', []))}
 Handoffs so far:       {json.dumps(_rl_memory.get('handoffs', []))}
 
 === ORIGINAL VISUAL REQUIREMENTS ===
-Background CSS:    {bp.get('background', {}).get('css')}
-Primary color:     {bp.get('color_scheme', {}).get('primary')}
-Hero headline:     "{bp.get('hero', {}).get('headline')}"
-Hero font size:    {bp.get('typography', {}).get('hero_size')} / weight {bp.get('hero', {}).get('headline_weight')}
-Hero has code:     {bp.get('hero', {}).get('has_code_snippet')} — "{bp.get('hero', {}).get('code_snippet_text')}"
-Hero logo icon:    {bp.get('hero', {}).get('has_logo_icon')} — {bp.get('hero', {}).get('logo_icon_shape')}
-Version badge:     "{bp.get('hero', {}).get('version_badge')}"
-Font family:       {bp.get('typography', {}).get('font_family')}
-Critical elements: {json.dumps(bp.get('critical_must_replicate', []))}
+Background CSS:       {bp.get('background', {}).get('css')}
+Primary color:        {bp.get('color_scheme', {}).get('primary')}
+Hero headline:        "{bp.get('hero', {}).get('headline')}"
+Hero font size:       {bp.get('typography', {}).get('hero_size')} / weight {bp.get('hero', {}).get('headline_weight')}
+Hero has code:        {bp.get('hero', {}).get('has_code_snippet')} — "{bp.get('hero', {}).get('code_snippet_text')}"
+Code snippet bg:      {bp.get('hero', {}).get('code_snippet_bg')} ({bp.get('hero', {}).get('code_snippet_style')} theme)
+Hero logo icon:       {bp.get('hero', {}).get('has_logo_icon')} — {bp.get('hero', {}).get('logo_icon_shape')}
+Announcement banner:  {bp.get('hero', {}).get('has_announcement_banner')} — "{bp.get('hero', {}).get('announcement_banner_text')}"
+Navbar icons:         {json.dumps(bp.get('navbar', {}).get('navbar_icons', []))}
+Version dropdown:     "{bp.get('navbar', {}).get('navbar_version_dropdown', '')}"
+Version badge:        "{bp.get('hero', {}).get('version_badge')}"
+Font family:          {bp.get('typography', {}).get('font_family')}
+Critical elements:    {json.dumps(bp.get('critical_must_replicate', []))}
 
 === GENERATED HTML (first 4000 chars) ===
 {html[:4000]}
@@ -718,8 +801,8 @@ Return ONLY this JSON — no other text:
     "footer":               0-10,
     "responsive_css":       0-10
   }},
-  "total_score": "sum of all 10 scores above",
-  "approved": "true only if total_score >= {APPROVAL_THRESHOLD}",
+  "total_score": 0,
+  "approved": false,
   "what_is_still_wrong": [
     "very specific issue 1 — name the element and the exact fix needed",
     "very specific issue 2",
@@ -743,10 +826,9 @@ Return ONLY this JSON — no other text:
 
     try:
         raw    = _safe_gemini(prompt, image_b64)
-        m      = re.search(r"\{.*\}", raw, re.DOTALL)
-        result = json.loads(m.group(0) if m else raw)
-        # Enforce strict threshold — never accept AI's own approved=true below threshold
-        total           = int(result.get("total_score", 0))
+        result = _safe_parse_json(raw)
+        # Enforce strict threshold — Python controls approved, not the LLM
+        total  = int(result.get("total_score", 0))
         result["total_score"] = total
         result["approved"]    = total >= APPROVAL_THRESHOLD
         sd = result.get("scores", {})
@@ -781,14 +863,10 @@ Return ONLY this JSON — no other text:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SUPERVISOR — DIRECT HTML PATCH (when workers keep missing a specific issue)
+# SUPERVISOR — DIRECT HTML PATCH
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _supervisor_direct_fix(html: str, bp: dict, instruction: str) -> str:
-    """
-    Gemini directly patches the HTML for issues workers keep failing to fix.
-    Logs the action into RL memory so workers know supervisor intervened.
-    """
     print(f"[SUPERVISOR] 🔧 Direct fix: {instruction[:80]}...")
     _rl_memory["gemini_actions"].append(f"Direct fix: {instruction[:80]}")
     prompt = f"""You are GEMINI SUPERVISOR directly patching a specific issue in the HTML clone.
@@ -796,10 +874,11 @@ def _supervisor_direct_fix(html: str, bp: dict, instruction: str) -> str:
 ISSUE TO FIX: {instruction}
 
 BLUEPRINT REFERENCE:
-  Background: {bp.get('background',{}).get('css')}
-  Primary:    {bp.get('color_scheme',{}).get('primary')}
-  Hero font:  {bp.get('typography',{}).get('hero_size')} / {bp.get('hero',{}).get('headline_weight')}
-  Critical:   {json.dumps(bp.get('critical_must_replicate',[]))}
+  Background:   {bp.get('background',{}).get('css')}
+  Primary:      {bp.get('color_scheme',{}).get('primary')}
+  Hero font:    {bp.get('typography',{}).get('hero_size')} / {bp.get('hero',{}).get('headline_weight')}
+  Navbar icons: {json.dumps(bp.get('navbar',{}).get('navbar_icons',[]))}
+  Critical:     {json.dumps(bp.get('critical_must_replicate',[]))}
 
 CURRENT HTML:
 {html[:6000]}
@@ -816,6 +895,29 @@ Return the COMPLETE fixed HTML. No markdown."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENT ISSUE TRACKER — auto-detects loops, forces direct fix
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _update_persistent_issues(new_issues: list):
+    """
+    Tracks issue frequency across rounds.
+    Issues appearing in 3+ rounds are flagged as 'persistent'
+    and will be shown prominently to workers AND trigger direct fix.
+    """
+    freq = _rl_memory.get("issue_frequency", {})
+    for issue in new_issues:
+        key = issue[:80]  # truncate for key
+        freq[key] = freq.get(key, 0) + 1
+    _rl_memory["issue_frequency"] = freq
+    # Persistent = appeared 3+ rounds
+    _rl_memory["persistent_issues"] = [
+        issue for issue, count in freq.items() if count >= 3
+    ]
+    if _rl_memory["persistent_issues"]:
+        print(f"[RL] 🔁 Persistent issues detected: {len(_rl_memory['persistent_issues'])}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -823,18 +925,22 @@ def run_agent_chain(data: dict) -> dict:
     """
     SUPERVISED RL PIPELINE — 90% approval threshold:
 
-    Stage 1: Gemini deep visual analysis → 12-field pixel-level blueprint
+    Stage 1: Gemini deep visual analysis → precise blueprint
+             (now includes navbar_icons, announcement_banner, code_snippet_bg)
 
     Loop up to MAX_ROUNDS (5):
-      a) Ollama builds HTML with blueprint + full RL mistake memory injected
+      a) Ollama builds HTML with blueprint + full RL memory injected
          └─ if Ollama fails → Gemini covers HTML task (handoff logged)
-      b) Groq styles HTML with blueprint + full RL mistake memory injected
+      b) Groq styles HTML with blueprint + full RL memory injected
          └─ if Groq fails → Gemini covers CSS task (handoff logged)
       c) Gemini strict-scores 10 dimensions vs original screenshot
+         └─ uses _safe_parse_json() — never fails on markdown-wrapped JSON
       d) RL memory updated: mistakes, wins, handoffs, score breakdown
-      e) If supervisor flags direct-fix needed → Gemini patches HTML
-      f) If total_score >= 90 → APPROVED, stop
-      g) Else → next round with targeted per-worker corrections
+      e) Persistent issue tracker updated — auto-flags repeated failures
+      f) Temperature escalates if score is stuck (adaptive exploration)
+      g) If issue persisted 3+ rounds → supervisor directly patches HTML
+      h) If total_score >= 90 → APPROVED, stop
+      i) Else → next round with targeted per-worker corrections
 
     Returns best HTML across all rounds.
     """
@@ -862,14 +968,15 @@ def run_agent_chain(data: dict) -> dict:
         "stage":    "🔍 Stage 1 — Deep Visual Analysis",
         "agent":    "Gemini Supervisor",
         "icon":     "🧠",
-        "role":     "Pixel-level screenshot analysis → 12-field precise blueprint",
+        "role":     "Pixel-level screenshot analysis → precise blueprint",
         "result":   "✅ Blueprint ready",
         "chars":    len(json.dumps(blueprint)),
         "duration": dur0,
         "details":  [
             {"agent": "Background", "status": str(blueprint.get("background",{}).get("css",""))[:80],      "duration": 0, "chars": 0, "reason": ""},
             {"agent": "Colors",     "status": str(blueprint.get("color_scheme",{}))[:80],                  "duration": 0, "chars": 0, "reason": ""},
-            {"agent": "Hero",       "status": f"headline='{blueprint.get('hero',{}).get('headline','')}'", "duration": 0, "chars": 0, "reason": ""},
+            {"agent": "Hero",       "status": f"headline='{blueprint.get('hero',{}).get('headline','')}' | banner={blueprint.get('hero',{}).get('has_announcement_banner',False)}", "duration": 0, "chars": 0, "reason": ""},
+            {"agent": "Navbar",     "status": f"icons={blueprint.get('navbar',{}).get('navbar_icons',[])} | search='{blueprint.get('navbar',{}).get('navbar_search_placeholder','')}'", "duration": 0, "chars": 0, "reason": ""},
             {"agent": "Critical",   "status": str(blueprint.get("critical_must_replicate",[]))[:100],      "duration": 0, "chars": 0, "reason": ""},
         ]
     })
@@ -886,6 +993,11 @@ def run_agent_chain(data: dict) -> dict:
         print(f"\n{'═'*58}")
         print(f"[PIPELINE] 🔄 ROUND {round_num}/{MAX_ROUNDS} — target: {APPROVAL_THRESHOLD}%")
         print(f"{'═'*58}")
+
+        # Adaptive temperature — escalates if stuck
+        temp = _adaptive_temperature(round_num, best_score)
+        if temp > 0.15:
+            print(f"[PIPELINE] 🌡️ Adaptive temperature: {temp:.2f} (exploring harder)")
 
         # ── Ollama: HTML Structure ───────────────────────────────
         ollama_prompt = _build_ollama_prompt(data, blueprint, round_num, ollama_correct)
@@ -906,9 +1018,10 @@ def run_agent_chain(data: dict) -> dict:
         })
 
         # ── Groq: CSS Styling ────────────────────────────────────
-        groq_prompt = _build_groq_prompt(data, blueprint, ollama_html, round_num, groq_correct)
+        groq_prompt = _build_groq_prompt(data, blueprint, ollama_html, round_num,
+                                          groq_correct, temp)
         groq_html, groq_model, groq_agent, groq_dur = \
-            _run_groq_with_handoff(groq_prompt, ollama_html, round_num, blueprint)
+            _run_groq_with_handoff(groq_prompt, ollama_html, round_num, blueprint, temp)
         g_note = " 🤝 Gemini covered" if groq_agent == "gemini" else ""
 
         best_this_round = groq_html or ollama_html
@@ -939,6 +1052,9 @@ def run_agent_chain(data: dict) -> dict:
         _rl_memory["groq_mistakes"].extend(feedback.get("groq_mistakes_this_round", []))
         _rl_memory["successful_patterns"].extend(feedback.get("what_worked_well", []))
 
+        # Update persistent issue tracker
+        _update_persistent_issues(feedback.get("what_is_still_wrong", []))
+
         if score > best_score:
             best_score               = score
             best_html                = best_this_round
@@ -948,8 +1064,18 @@ def run_agent_chain(data: dict) -> dict:
         ollama_correct = feedback.get("ollama_next_round_fix", "")
         groq_correct   = feedback.get("groq_next_round_fix",   "")
 
-        # Supervisor direct fix if workers keep missing something
-        if feedback.get("supervisor_direct_fix_needed") and feedback.get("supervisor_fix_instruction"):
+        # ── Auto direct-fix for persistent issues ───────────────
+        auto_fix_triggered = False
+        if _rl_memory.get("persistent_issues") and best_html:
+            top_persistent = _rl_memory["persistent_issues"][0]
+            print(f"[SUPERVISOR] 🔁 Auto-triggering direct fix for persistent issue: {top_persistent[:60]}...")
+            best_html         = _supervisor_direct_fix(best_html, blueprint, top_persistent)
+            auto_fix_triggered = True
+
+        # ── Manual direct-fix if supervisor explicitly flags it ──
+        if (not auto_fix_triggered
+                and feedback.get("supervisor_direct_fix_needed")
+                and feedback.get("supervisor_fix_instruction")):
             best_html = _supervisor_direct_fix(
                 best_html, blueprint, feedback["supervisor_fix_instruction"])
 
@@ -983,6 +1109,7 @@ def run_agent_chain(data: dict) -> dict:
             f"[RL] ollama_mistakes={len(_rl_memory['ollama_mistakes'])} | "
             f"groq_mistakes={len(_rl_memory['groq_mistakes'])} | "
             f"wins={len(_rl_memory['successful_patterns'])} | "
+            f"persistent={len(_rl_memory['persistent_issues'])} | "
             f"handoffs={len(_rl_memory['handoffs'])}"
         )
 
@@ -1011,6 +1138,7 @@ def run_agent_chain(data: dict) -> dict:
         f"[RL SUMMARY] ollama_mistakes={len(_rl_memory['ollama_mistakes'])} | "
         f"groq_mistakes={len(_rl_memory['groq_mistakes'])} | "
         f"wins={len(_rl_memory['successful_patterns'])} | "
+        f"persistent={len(_rl_memory['persistent_issues'])} | "
         f"handoffs={len(_rl_memory['handoffs'])} | "
         f"supervisor_fixes={len(_rl_memory['gemini_actions'])}\n"
     )
@@ -1022,16 +1150,18 @@ def run_agent_chain(data: dict) -> dict:
         "chars":      len(best_html),
         "blueprint":  blueprint,
         "rl_memory":  {
-            "rounds":           rounds_taken,
-            "scores":           _rl_memory["round_scores"],
-            "score_breakdown":  _rl_memory["score_breakdown"],
-            "best_score":       best_score,
-            "best_round":       _rl_memory["best_round"],
-            "ollama_mistakes":  _rl_memory["ollama_mistakes"],
-            "groq_mistakes":    _rl_memory["groq_mistakes"],
-            "patterns_learned": _rl_memory["successful_patterns"],
-            "handoffs":         _rl_memory["handoffs"],
-            "gemini_actions":   _rl_memory["gemini_actions"],
+            "rounds":            rounds_taken,
+            "scores":            _rl_memory["round_scores"],
+            "score_breakdown":   _rl_memory["score_breakdown"],
+            "best_score":        best_score,
+            "best_round":        _rl_memory["best_round"],
+            "ollama_mistakes":   _rl_memory["ollama_mistakes"],
+            "groq_mistakes":     _rl_memory["groq_mistakes"],
+            "patterns_learned":  _rl_memory["successful_patterns"],
+            "persistent_issues": _rl_memory["persistent_issues"],
+            "issue_frequency":   _rl_memory["issue_frequency"],
+            "handoffs":          _rl_memory["handoffs"],
+            "gemini_actions":    _rl_memory["gemini_actions"],
         },
         "final_check": {
             "visual_match_score": best_score,
